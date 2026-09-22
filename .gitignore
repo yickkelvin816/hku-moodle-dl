@@ -1,0 +1,5 @@
+__pycache__/
+profile/
+snapshot.json
+state.json
+.DS_Store
