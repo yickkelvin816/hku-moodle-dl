@@ -86,7 +86,7 @@ activity is not re-fetched.)
 
 ## Configuration
 
-Edit the constants at the top of `hku_moodle.py`:
+Edit the constants in `moodle_dl/config.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|
