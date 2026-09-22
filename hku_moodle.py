@@ -11,7 +11,8 @@ Usage:
     python3 hku_moodle.py courses          # list Moodle courses and their download folder mapping
     python3 hku_moodle.py check            # crawl, report new items, download new files
     python3 hku_moodle.py check --dry-run  # show what would be downloaded, write nothing
-    python3 hku_moodle.py check --headed   # same, with a visible browser window
+    python3 hku_moodle.py check --parallel # crawl course pages concurrently (default; --serial to disable)
+    python3 hku_moodle.py check --headed   # debug only: show the (otherwise headless) browser
     python3 hku_moodle.py status           # show the last snapshot
 
 How it works:
@@ -29,6 +30,7 @@ How it works:
   (or delete snapshot.json entirely for a full re-mirror).
 - Only courses whose code is in INCLUDE_CODES are crawled (empty set = every course).
 """
+import asyncio
 import html
 import json
 import re
@@ -49,6 +51,8 @@ DOWNLOADS_ROOT = Path.home() / "Downloads" / "HKU Moodle Download"
 INCLUDE_CODES = {"CAES9542", "COMP3323", "COMP3353", "COMP3355", "COMP4801"}
 FILE_TYPES = {"resource", "folder"}
 MAX_FOLDER_FILES = 60
+# concurrent course-tab crawlers in `check --parallel` (network-bound: 4 is plenty)
+MAX_WORKERS = 4
 
 EXT_BY_TYPE = {
     "application/pdf": ".pdf",
@@ -229,12 +233,12 @@ def try_silent_sso(page) -> bool:
 
 
 def get_courses(page):
-    page.goto(f"{MOODLE}/my/courses.php", wait_until="load")
+    page.goto(f"{MOODLE}/my/courses.php", wait_until="domcontentloaded")
     time.sleep(1.5)
     if not logged_in(page.url):
         if not try_silent_sso(page):
             return None
-        page.goto(f"{MOODLE}/my/courses.php", wait_until="load")
+        page.goto(f"{MOODLE}/my/courses.php", wait_until="domcontentloaded")
         time.sleep(1.5)
         if not logged_in(page.url):
             return None
@@ -262,7 +266,7 @@ def get_courses(page):
 
 
 def get_items(page, course_id):
-    page.goto(f"{MOODLE}/course/view.php?id={course_id}", wait_until="load")
+    page.goto(f"{MOODLE}/course/view.php?id={course_id}", wait_until="domcontentloaded")
     time.sleep(1.5)
     raw = page.evaluate(
         """() => {
@@ -299,6 +303,112 @@ def get_items(page, course_id):
         title = it["title"].split("\n")[0].strip() or f"{typ}-{iid}"
         section = " ".join(it.get("section", "").split())
         # strip the collapse/expand toggle text Moodle puts in the section header
+        section = re.sub(r"^(Collapse|Expand)\s+", "", section)
+        section = re.sub(r"\s+(Collapse|Expand) all$", "", section)
+        if not section:
+            section = f"Section {it.get('num') or 1}"
+        items[key] = {
+            "type": typ, "id": iid, "title": title,
+            "href": it["href"], "section": section,
+        }
+    return items
+
+
+# ------------------------------------------------- async twins (parallel) ----
+# The sync Playwright API is thread-pinned (greenlets), so concurrency needs
+# the async API. These twins mirror get_courses/get_items exactly; anything
+# pure (course_code, safe_name, norm_key, ...) is shared with the sync path.
+
+async def alaunch(pw, headless):
+    ctx = await pw.chromium.launch_persistent_context(str(PROFILE), headless=headless)
+    if STATE.exists():
+        try:
+            data = json.loads(STATE.read_text())
+            cookies = data if isinstance(data, list) else data.get("cookies", [])
+            if cookies:
+                await ctx.add_cookies(cookies)
+        except Exception:
+            pass
+    return ctx
+
+
+async def a_try_silent_sso(page) -> bool:
+    try:
+        await page.goto(f"{MOODLE}/login/index.php?authCAS=CAS", wait_until="load")
+    except Exception:
+        return False
+    for _ in range(15):
+        await asyncio.sleep(1.0)
+        if page.url.startswith(MOODLE):
+            return logged_in(page.url)
+    return False
+
+
+async def aget_courses(page):
+    await page.goto(f"{MOODLE}/my/courses.php", wait_until="domcontentloaded")
+    await asyncio.sleep(1.5)
+    if not logged_in(page.url):
+        if not await a_try_silent_sso(page):
+            return None
+        await page.goto(f"{MOODLE}/my/courses.php", wait_until="domcontentloaded")
+        await asyncio.sleep(1.5)
+        if not logged_in(page.url):
+            return None
+    raw = await page.eval_on_selector_all(
+        'a[href*="/course/view.php?id="]',
+        "els => els.map(e => ({href: e.href, name: (e.getAttribute('aria-label') || e.innerText || '').trim()}))",
+    )
+    courses, seen = [], set()
+    for c in raw:
+        m = re.search(r"id=(\d+)", c["href"])
+        if not m or m.group(1) in seen:
+            continue
+        seen.add(m.group(1))
+        lines = [
+            ln.strip()
+            for ln in c["name"].split("\n")
+            if ln.strip() and ln.strip().lower() != "course name"
+        ]
+        name = " ".join(lines) or f"course-{m.group(1)}"
+        courses.append({"id": m.group(1), "name": name})
+    return courses
+
+
+async def aget_items(page, course_id):
+    await page.goto(f"{MOODLE}/course/view.php?id={course_id}", wait_until="domcontentloaded")
+    await asyncio.sleep(1.5)
+    raw = await page.evaluate("""() => {
+        const secs = Array.from(
+            document.querySelectorAll('li.section, li.course-section, section'));
+        const out = [];
+        document.querySelectorAll('li.activity, .activity-item').forEach(act => {
+            const a = act.querySelector('a.aalink, .activity-instance a');
+            if (!a) return;
+            let section = '', num = 0;
+            const sec = act.closest('li.section, li.course-section, section');
+            if (sec) {
+                num = secs.indexOf(sec) + 1;
+                const h = sec.querySelector(
+                    '.sectionname, .course-section-header, .section-title, h3');
+                section = h ? (h.innerText || h.getAttribute('aria-label') || '') : '';
+            }
+            out.push({href: a.href, title: (a.innerText || '').trim(),
+                      section: section.trim(), num});
+        });
+        return out;
+    }""")
+    items, seen = {}, set()
+    for it in raw:
+        m = re.search(r"/mod/(\w+)/view\.php\?id=(\d+)", it["href"])
+        if not m:
+            continue
+        typ, iid = m.group(1), m.group(2)
+        key = f"{typ}/{iid}"
+        if key in seen:
+            continue
+        seen.add(key)
+        title = it["title"].split("\n")[0].strip() or f"{typ}-{iid}"
+        section = " ".join(it.get("section", "").split())
         section = re.sub(r"^(Collapse|Expand)\s+", "", section)
         section = re.sub(r"\s+(Collapse|Expand) all$", "", section)
         if not section:
@@ -392,8 +502,324 @@ def download_item(ctx, item, dest_dir: Path, existing: set, dry: bool):
     return saved, dups, fails
 
 
+async def adownload_one(ctx, url, dest_dir: Path, fallback: str, existing: set, dry: bool):
+    """async twin of download_one. Returns (status, filename)."""
+    ub = url_basename(url)
+    if ub and norm_key(ub) in existing:
+        return "dup", ub
+    r = await ctx.request.get(url)
+    if not r.ok:
+        return "fail", ""
+    ct = (r.headers.get("content-type") or "").split(";")[0].strip()
+    if "text/html" in ct:
+        return "html", ""
+    name = filename_from(r, r.url, fallback)
+    if norm_key(name) in existing:
+        return "dup", name
+    existing.add(norm_key(name))
+    if dry:
+        return "would-save", name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    p = unique_path(dest_dir / safe_name(name))
+    p.write_bytes(r.body())
+    return "saved", p.name
+
+
+async def adownload_item(ctx, item, dest_dir: Path, existing: set, dry: bool):
+    """async twin of download_item. Returns (saved, dups, failures)."""
+    saved, dups, fails = [], 0, 0
+    if item["type"] == "resource":
+        st, name = await adownload_one(ctx, item["href"], dest_dir, item["title"], existing, dry)
+        if st in ("saved", "would-save"):
+            saved.append(name)
+        elif st == "dup":
+            dups += 1
+        else:
+            fails += 1
+    elif item["type"] == "folder":
+        r = await ctx.request.get(item["href"])
+        if r.ok:
+            links = []
+            for link in re.findall(r'href="([^"]*pluginfile\.php[^"]*)"', r.text()):
+                link = html.unescape(link)
+                if link not in links:
+                    links.append(link)
+            for link in links[:MAX_FOLDER_FILES]:
+                fb = url_basename(link) or item["title"]
+                st, name = await adownload_one(ctx, link, dest_dir, fb, existing, dry)
+                if st in ("saved", "would-save"):
+                    saved.append(name)
+                elif st == "dup":
+                    dups += 1
+                else:
+                    fails += 1
+    return saved, dups, fails
+
+
+async def acrawl_course(page, ctx, course, prev, prev_time, dry, sem, existing_registry):
+    """async twin of crawl_course + parallelism: runs on its own tab under a
+    semaphore; the registry keeps one shared per-course `existing` key-set so
+    concurrent courses can't download the same file into two folders."""
+    cid, cname = course["id"], course["name"]
+    code = course_code(cname)
+    if INCLUDE_CODES and code not in INCLUDE_CODES:
+        return {"course": course, "skipped": True, "lines": [
+            f"{cname}: skipped (code {code} not in INCLUDE_CODES)"],
+            "items": {}, "marked": {}, "n_saved": 0, "n_backfilled": 0}
+
+    async with sem:
+        items = await aget_items(page, cid)
+
+        old_items = prev.get(cid, {}).get("items", {})
+        prev_dl = prev.get(cid, {}).get("downloaded", {})
+        new_keys = [k for k in items if k not in old_items]
+        renamed = [
+            (old_items[k]["title"], items[k]["title"])
+            for k in items
+            if k in old_items and old_items[k]["title"] != items[k]["title"]
+        ]
+
+        cdir, note = find_course_dir(code, cname)
+        existing = existing_registry(cid)
+        marked = {}
+        n_saved = n_backfilled = 0
+
+        def mark(k, it, files):
+            dest = item_dest(cdir, it)
+            marked[k] = {"files": files, "dest": str(dest.relative_to(cdir))}
+
+        lines = []
+        if note:
+            lines.append(f"  (folder: {note})")
+
+        for k in new_keys:
+            it = items[k]
+            extra = ""
+            if it["type"] in FILE_TYPES and cdir:
+                saved, dups, fails = await adownload_item(
+                    ctx, it, item_dest(cdir, it), existing, dry)
+                if saved:
+                    n_saved += len(saved)
+                    extra = "  -> " + ("would save: " if dry else "saved: ") + ", ".join(saved)
+                    mark(k, it, saved)
+                elif dups and not fails:
+                    extra = "  (already on disk)"
+                    mark(k, it, [])
+            lines.append(f"  + [{it['type']}] {it['title']}  ({it['section']}){extra}")
+
+        # items seen before but never recorded as downloaded: fetch once, then
+        # the snapshot remembers them forever (deleting local files will NOT
+        # trigger a re-download).
+        for k, it in items.items():
+            if k in new_keys or it["type"] not in FILE_TYPES or not cdir:
+                continue
+            if k in prev_dl or k in marked:
+                continue
+            saved, dups, fails = await adownload_item(
+                ctx, it, item_dest(cdir, it), existing, dry)
+            if saved:
+                n_backfilled += len(saved)
+                lines.append(f"  \u21b7 downloaded: {', '.join(saved)}")
+                mark(k, it, saved)
+            elif dups and not fails:
+                mark(k, it, [])
+
+        # carry forward marks for items that need no attention this run
+        for k, rec in prev_dl.items():
+            if k in items and k not in marked:
+                marked[k] = rec
+
+        for old_t, new_t in renamed:
+            lines.append(f"  ~ renamed: {old_t}  =>  {new_t}")
+
+        if lines:
+            lines = [f"{cname}  ->  {cdir}:"] + lines
+        elif prev_time:
+            lines = [f"{cname}: no changes"]
+        return {"course": course, "items": items, "marked": marked, "lines": lines,
+                "n_saved": n_saved, "n_backfilled": n_backfilled}
+
+
 # ---------------------------------------------------------------- check ----
-def do_check(dry: bool, headless: bool) -> int:
+async def ado_check(dry: bool, headless: bool) -> int:
+    from playwright.async_api import async_playwright
+
+    prev, prev_time = {}, None
+    if SNAPSHOT.exists():
+        old = json.loads(SNAPSHOT.read_text())
+        prev_time = old.get("checked_at")
+        prev = old.get("courses", {})
+
+    async with async_playwright() as pw:
+        ctx = await alaunch(pw, headless=headless)
+        page = await ctx.new_page()
+        page.set_default_timeout(45000)
+        courses = await aget_courses(page)
+        if courses is None:
+            print("Not logged in (session expired?). Run:  python3 hku_moodle.py login")
+            await ctx.close()
+            return 3
+        cookies = await ctx.cookies()
+        STATE.write_text(json.dumps(cookies, indent=1))  # keep cookies fresh
+        STATE.chmod(0o600)
+        await page.close()          # dashboard tab no longer needed
+
+        state = {"checked_at": datetime.now().isoformat(timespec="seconds"), "courses": {}}
+        report, n_saved, n_backfilled = [], 0, 0
+
+        if not courses:
+            print("No courses found on /my/courses.php -- check selectors/theme.")
+
+        # one tab per course, at most MAX_WORKERS crawling simultaneously
+        sem = asyncio.Semaphore(MAX_WORKERS)
+        existing_sets = {}          # course id -> disk key-set (created once)
+
+        def existing_registry(cid):
+            if cid not in existing_sets:
+                course = next(c for c in courses if c["id"] == cid)
+                cdir, _ = find_course_dir(course_code(course["name"]), course["name"])
+                existing_sets[cid] = existing_keys(cdir)
+            return existing_sets[cid]
+
+        async def run_one(course):
+            page = await ctx.new_page()
+            page.set_default_timeout(45000)
+            try:
+                return await acrawl_course(
+                    page, ctx, course, prev, prev_time, dry, sem, existing_registry)
+            except Exception as e:
+                return {"course": course, "error": str(e)}
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+        results = await asyncio.gather(*(run_one(c) for c in courses))
+
+        for res in results:
+            if res.get("error"):
+                report.append(
+                    f"{res['course']['name']}: ERROR crawling ({res['error']})")
+                continue
+            report.extend(res["lines"])
+            if res.get("skipped"):
+                continue
+            state["courses"][res["course"]["id"]] = {
+                "name": res["course"]["name"],
+                "items": res["items"],
+                "downloaded": res["marked"],
+            }
+            n_saved += res["n_saved"]
+            n_backfilled += res["n_backfilled"]
+
+        await ctx.close()
+
+    if not dry:
+        SNAPSHOT.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+
+    tag = "[dry] " if dry else ""
+    if not prev_time:
+        total = sum(len(c["items"]) for c in state["courses"].values())
+        print(f"{tag}Baseline saved: {len(state['courses'])} courses, {total} items.")
+    else:
+        print(f"{tag}=== New materials since {prev_time} ===")
+    print("\n".join(report) if report else "Nothing.")
+    if n_saved or n_backfilled or dry:
+        verb = "would download" if dry else "downloaded"
+        print(f"\n{tag}{n_saved + n_backfilled} file(s) {verb} into '{DOWNLOADS_ROOT}'.")
+    return 0
+
+
+def crawl_course(page, ctx, course, prev, prev_time, dry):
+    """Crawl ONE course page and download its new items (serial sync path).
+
+    Returns a bundle: {course, items, marked, lines, n_saved, n_backfilled},
+    {course, skipped} for allowlist-skips, or {course, error} upstream.
+    """
+    cid, cname = course["id"], course["name"]
+    code = course_code(cname)
+    if INCLUDE_CODES and code not in INCLUDE_CODES:
+        return {"course": course, "skipped": True, "lines": [
+            f"{cname}: skipped (code {code} not in INCLUDE_CODES)"],
+            "items": {}, "marked": {}, "n_saved": 0, "n_backfilled": 0}
+
+    items = get_items(page, cid)
+
+    old_items = prev.get(cid, {}).get("items", {})
+    prev_dl = prev.get(cid, {}).get("downloaded", {})
+    new_keys = [k for k in items if k not in old_items]
+    renamed = [
+        (old_items[k]["title"], items[k]["title"])
+        for k in items
+        if k in old_items and old_items[k]["title"] != items[k]["title"]
+    ]
+
+    cdir, note = find_course_dir(code, cname)
+    existing = existing_keys(cdir)
+    marked = {}       # download marks decided during THIS run
+    n_saved = n_backfilled = 0
+
+    def mark(k, it, files):
+        dest = item_dest(cdir, it)
+        marked[k] = {"files": files, "dest": str(dest.relative_to(cdir))}
+
+    lines = []
+    if note:
+        lines.append(f"  (folder: {note})")
+
+    for k in new_keys:
+        it = items[k]
+        extra = ""
+        if it["type"] in FILE_TYPES and cdir:
+            saved, dups, fails = download_item(
+                ctx, it, item_dest(cdir, it), existing, dry)
+            if saved:
+                n_saved += len(saved)
+                extra = "  -> " + ("would save: " if dry else "saved: ") + ", ".join(saved)
+                mark(k, it, saved)
+            elif dups and not fails:
+                extra = "  (already on disk)"
+                mark(k, it, [])
+        lines.append(f"  + [{it['type']}] {it['title']}  ({it['section']}){extra}")
+
+    # items seen before but never recorded as downloaded (first run after
+    # the switch to ~/Downloads, or earlier failures): fetch once, then
+    # the snapshot remembers them forever -- deleting local files will
+    # NOT trigger a re-download.
+    for k, it in items.items():
+        if k in new_keys or it["type"] not in FILE_TYPES or not cdir:
+            continue
+        if k in prev_dl or k in marked:
+            continue
+        saved, dups, fails = download_item(
+            ctx, it, item_dest(cdir, it), existing, dry)
+        if saved:
+            n_backfilled += len(saved)
+            lines.append(f"  \u21b7 downloaded: {', '.join(saved)}")
+            mark(k, it, saved)
+        elif dups and not fails:
+            mark(k, it, [])
+
+    # carry forward marks for items that need no attention this run
+    for k, rec in prev_dl.items():
+        if k in items and k not in marked:
+            marked[k] = rec
+
+    for old_t, new_t in renamed:
+        lines.append(f"  ~ renamed: {old_t}  =>  {new_t}")
+
+    if lines:
+        lines = [f"{cname}  ->  {cdir}:"] + lines
+    elif prev_time:
+        lines = [f"{cname}: no changes"]
+    return {"course": course, "items": items, "marked": marked, "lines": lines,
+            "n_saved": n_saved, "n_backfilled": n_backfilled}
+
+
+def do_check(dry: bool, headless: bool, parallel: bool) -> int:
+    if parallel:
+        return asyncio.run(ado_check(dry, headless))
     from playwright.sync_api import sync_playwright
 
     prev = {}
@@ -420,85 +846,23 @@ def do_check(dry: bool, headless: bool) -> int:
 
         if not courses:
             print("No courses found on /my/courses.php -- check selectors/theme.")
-        for c in courses:
-            cid, cname = c["id"], c["name"]
-            code = course_code(cname)
-            if INCLUDE_CODES and code not in INCLUDE_CODES:
-                report.append(f"{cname}: skipped (code {code} not in INCLUDE_CODES)")
+        results = [crawl_course(page, ctx, c, prev, prev_time, dry) for c in courses]
+
+        for res in results:
+            if res.get("error"):
+                report.append(
+                    f"{res['course']['name']}: ERROR crawling ({res['error']})")
                 continue
-            try:
-                items = get_items(page, cid)
-            except Exception as e:
-                report.append(f"{cname}: ERROR crawling ({e})")
+            report.extend(res["lines"])
+            if res.get("skipped"):
                 continue
-
-            old_items = prev.get(cid, {}).get("items", {})
-            prev_dl = prev.get(cid, {}).get("downloaded", {})
-            new_keys = [k for k in items if k not in old_items]
-            renamed = [
-                (old_items[k]["title"], items[k]["title"])
-                for k in items
-                if k in old_items and old_items[k]["title"] != items[k]["title"]
-            ]
-
-            cdir, note = find_course_dir(code, cname)
-            existing = existing_keys(cdir)
-            marked = {}       # download marks decided during THIS run
-
-            def mark(k, it, files):
-                dest = item_dest(cdir, it)
-                marked[k] = {"files": files, "dest": str(dest.relative_to(cdir))}
-
-            lines = []
-            if note:
-                lines.append(f"  (folder: {note})")
-
-            for k in new_keys:
-                it = items[k]
-                extra = ""
-                if it["type"] in FILE_TYPES and cdir:
-                    saved, dups, fails = download_item(
-                        ctx, it, item_dest(cdir, it), existing, dry)
-                    if saved:
-                        n_saved += len(saved)
-                        extra = "  -> " + ("would save: " if dry else "saved: ") + ", ".join(saved)
-                        mark(k, it, saved)
-                    elif dups and not fails:
-                        extra = "  (already on disk)"
-                        mark(k, it, [])
-                lines.append(f"  + [{it['type']}] {it['title']}  ({it['section']}){extra}")
-
-            # items seen before but never recorded as downloaded (first run after
-            # the switch to ~/Downloads, or earlier failures): fetch once, then
-            # the snapshot remembers them forever -- deleting local files will
-            # NOT trigger a re-download.
-            for k, it in items.items():
-                if k in new_keys or it["type"] not in FILE_TYPES or not cdir:
-                    continue
-                if k in prev_dl or k in marked:
-                    continue
-                saved, dups, fails = download_item(
-                    ctx, it, item_dest(cdir, it), existing, dry)
-                if saved:
-                    n_backfilled += len(saved)
-                    lines.append(f"  \u21b7 downloaded: {', '.join(saved)}")
-                    mark(k, it, saved)
-                elif dups and not fails:
-                    mark(k, it, [])
-
-            # carry forward marks for items that need no attention this run
-            for k, rec in prev_dl.items():
-                if k in items and k not in marked:
-                    marked[k] = rec
-
-            for old_t, new_t in renamed:
-                lines.append(f"  ~ renamed: {old_t}  =>  {new_t}")
-
-            if lines:
-                report.append(f"{cname}  ->  {cdir}:\n" + "\n".join(lines))
-            elif prev_time:
-                report.append(f"{cname}: no changes")
-            state["courses"][cid] = {"name": cname, "items": items, "downloaded": marked}
+            state["courses"][res["course"]["id"]] = {
+                "name": res["course"]["name"],
+                "items": res["items"],
+                "downloaded": res["marked"],
+            }
+            n_saved += res["n_saved"]
+            n_backfilled += res["n_backfilled"]
 
         ctx.close()
 
@@ -564,7 +928,11 @@ def main():
     if cmd == "login":
         sys.exit(do_login())
     elif cmd == "check":
-        sys.exit(do_check(dry="--dry-run" in sys.argv, headless="--headed" not in sys.argv))
+        sys.exit(do_check(
+            dry="--dry-run" in sys.argv,
+            headless="--headed" not in sys.argv,      # headless unless asked
+            parallel="--serial" not in sys.argv,      # parallel unless asked
+        ))
     elif cmd == "courses":
         sys.exit(do_courses())
     elif cmd == "status":

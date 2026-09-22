@@ -8,12 +8,17 @@ Use only Python + Playwright without browser extension or keylogging.
 
 ## Features
 
+- **Parallel crawl**: course pages are fetched concurrently (one tab per course,
+  up to 4 at a time) — roughly 2× faster than the old serial walk; `--serial`
+  restores the old behavior
 - Reports new items per course since the last `check`
 - Mirrors Moodle's structure: `<course>/<section>/...`, folder activities nested deeper
 - No re-downloads: `snapshot.json` records every item ever fetched — deleting
   files locally never triggers a re-download
 - Session persists across reboots; sign in once, re-auth every few weeks
 - Course allowlist (`INCLUDE_CODES`) to crawl only what you care about
+- Always headless (no window pops up); only `login` opens one, because you type
+  the SSO + MFA yourself
 
 ## Requirements
 
@@ -46,11 +51,17 @@ chain and prints `Login OK`.
 ### Daily
 
 ```bash
-python3 hku_moodle.py check            # crawl, report new items, download new files
+python3 hku_moodle.py check            # crawl (parallel), report new items, download new files
 python3 hku_moodle.py check --dry-run  # preview only, write nothing
+python3 hku_moodle.py check --serial   # old one-course-at-a-time crawl
 python3 hku_moodle.py status           # show last snapshot
 python3 hku_moodle.py courses          # list courses + folder mapping
 ```
+
+`check` runs headless — nothing appears on screen. It fetches the course
+dashboard once, then crawls every allowlisted course page concurrently (one
+browser tab per course, at most `MAX_WORKERS` tabs active). A `--headed` flag
+exists for debugging only: it shows the otherwise-invisible browser.
 
 Downloads land as:
 
@@ -81,6 +92,7 @@ Edit the constants at the top of `hku_moodle.py`:
 |---|---|---|
 | `DOWNLOADS_ROOT` | `~/Downloads/HKU Moodle Download` | Mirror root. |
 | `INCLUDE_CODES` | several COMP/CAES codes | Course codes to crawl. `set()` = every course. |
+| `MAX_WORKERS` | `4` | Concurrent course tabs in a parallel `check`. |
 
 ## Troubleshooting
 
