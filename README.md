@@ -36,6 +36,26 @@ python3 -m playwright install chromium
 
 Uses Playwright's own Chromium — your everyday Chrome/Safari is never touched.
 
+## Project layout
+
+`hku_moodle.py` is a thin CLI; the logic lives in the `moodle_dl/` package:
+
+```
+hku_moodle.py        CLI entry point (command dispatch only)
+moodle_dl/
+├── config.py        paths, INCLUDE_CODES allowlist, limits, MIME map
+├── naming.py        pure naming/dedupe: course codes, safe names, folder mapping
+├── session.py       browser launch, cookie persistence, SSO helpers, login flow
+├── crawler.py       dashboard + course-page scraping (sync and async twins)
+├── downloader.py    file fetching, naming, dedupe, saving (sync and async twins)
+├── course_run.py    per-course crawl + download (shared by both check paths)
+└── checker.py       check/courses/status orchestration, snapshot safeguards
+```
+
+Sync/async twins: the parallel `check` needs Playwright's async API (the sync
+API is thread-pinned), so crawling/downloading exist twice, line-for-line
+equivalent; `--serial` uses the sync pair.
+
 ## Usage
 
 ### First sign-in
@@ -102,9 +122,13 @@ Edit the constants in `moodle_dl/config.py`:
 | Chromium launch error right after another run | Profile lock — wait a few seconds or `pkill -f hku_moodle`, retry. |
 | Login window parked on the portal page | Wait; the script nudges up to 3 times. |
 | Crawl died midway (rare) | Re-run `check`; it's idempotent. |
+| One course shows `ERROR crawling` | Its previous snapshot entry is kept; re-run `check`. |
+| `every course failed to crawl` (exit 4) | Total failure — `snapshot.json` is left untouched. Usually a network drop or expired session: re-run, or `login` if it persists. |
 
 ## Security
 
 `state.json` and `profile/` contain live login cookies — **never share them**.
-Share only `hku_moodle.py`. Everything runs locally and talks only to
+Share the repo (or at least `hku_moodle.py` **and** the whole `moodle_dl/`
+folder — the CLI won't run without it), minus `state.json`, `profile/`, and
+`snapshot.json`. Everything runs locally and talks only to
 `moodle.hku.hk`, `hkuportal.hku.hk`, and `login.microsoftonline.com`.
