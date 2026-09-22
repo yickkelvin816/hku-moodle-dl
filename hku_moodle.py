@@ -521,7 +521,7 @@ async def adownload_one(ctx, url, dest_dir: Path, fallback: str, existing: set, 
         return "would-save", name
     dest_dir.mkdir(parents=True, exist_ok=True)
     p = unique_path(dest_dir / safe_name(name))
-    p.write_bytes(r.body())
+    p.write_bytes(await r.body())
     return "saved", p.name
 
 
@@ -540,7 +540,7 @@ async def adownload_item(ctx, item, dest_dir: Path, existing: set, dry: bool):
         r = await ctx.request.get(item["href"])
         if r.ok:
             links = []
-            for link in re.findall(r'href="([^"]*pluginfile\.php[^"]*)"', r.text()):
+            for link in re.findall(r'href="([^"]*pluginfile\.php[^"]*)"', await r.text()):
                 link = html.unescape(link)
                 if link not in links:
                     links.append(link)
@@ -697,14 +697,22 @@ async def ado_check(dry: bool, headless: bool) -> int:
 
         results = await asyncio.gather(*(run_one(c) for c in courses))
 
+        fresh = 0        # courses actually crawled this run
         for res in results:
             if res.get("error"):
                 report.append(
                     f"{res['course']['name']}: ERROR crawling ({res['error']})")
+                # keep the previous snapshot entry so one bad crawl never
+                # erases download history (and thus never re-downloads
+                # everything on the next run)
+                cid = res["course"]["id"]
+                if cid in prev:
+                    state["courses"][cid] = prev[cid]
                 continue
             report.extend(res["lines"])
             if res.get("skipped"):
                 continue
+            fresh += 1
             state["courses"][res["course"]["id"]] = {
                 "name": res["course"]["name"],
                 "items": res["items"],
@@ -712,6 +720,13 @@ async def ado_check(dry: bool, headless: bool) -> int:
             }
             n_saved += res["n_saved"]
             n_backfilled += res["n_backfilled"]
+
+        # nothing crawled successfully -> do not touch the snapshot at all
+        if fresh == 0 and any(r.get("error") for r in results):
+            print("ERROR: every course failed to crawl -- keeping the old "
+                  "snapshot untouched.")
+            await ctx.close()
+            return 4
 
         await ctx.close()
 
@@ -848,14 +863,19 @@ def do_check(dry: bool, headless: bool, parallel: bool) -> int:
             print("No courses found on /my/courses.php -- check selectors/theme.")
         results = [crawl_course(page, ctx, c, prev, prev_time, dry) for c in courses]
 
+        fresh = 0        # courses actually crawled this run
         for res in results:
             if res.get("error"):
                 report.append(
                     f"{res['course']['name']}: ERROR crawling ({res['error']})")
+                cid = res["course"]["id"]
+                if cid in prev:
+                    state["courses"][cid] = prev[cid]
                 continue
             report.extend(res["lines"])
             if res.get("skipped"):
                 continue
+            fresh += 1
             state["courses"][res["course"]["id"]] = {
                 "name": res["course"]["name"],
                 "items": res["items"],
@@ -863,6 +883,13 @@ def do_check(dry: bool, headless: bool, parallel: bool) -> int:
             }
             n_saved += res["n_saved"]
             n_backfilled += res["n_backfilled"]
+
+        if prev and not state["courses"] and any(
+                r.get("error") for r in results):
+            print("ERROR: every course failed to crawl -- keeping the old "
+                  "snapshot untouched.")
+            ctx.close()
+            return 4
 
         ctx.close()
 
